@@ -1,27 +1,31 @@
 """
-VALORANT SOUND RADAR — Windows Sender Script
-============================================
-Captures Windows audio output via WASAPI/Stereo Mix
-and streams it over UDP to your secondary laptop.
+VALORANT SOUND RADAR — Windows Sender
+======================================
+Run this on your gaming laptop while playing Valorant.
+Captures Windows audio output and streams to secondary laptop.
 
 Setup:
-  1. Copy .env.example to .env
-  2. Set MAC_IP to your secondary laptop's IP
-  3. pip install sounddevice numpy python-dotenv
-  4. python sender_windows.py
+  1. Set MAC_IP to your secondary laptop's IP address
+  2. pip install sounddevice numpy
+  3. python sender_windows.py
 """
 
 import sounddevice as sd
 import numpy as np
 import socket
-import time
-from config import MAC_IP, PORT, SAMPLE_RATE, CHUNK_SIZE, CHANNELS
+
+# ─── CONFIG ───────────────────────────────────────────────
+MAC_IP      = "xxx.xxx.x.xx"   # change this to your secondary laptop's IP
+PORT        = 5005
+SAMPLE_RATE = 44100
+CHUNK_SIZE  = 1024
+CHANNELS    = 2
+# ──────────────────────────────────────────────────────────
 
 sock   = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 target = (MAC_IP, PORT)
 
 def audio_callback(indata, frames, time_info, status):
-    """Send each audio chunk over UDP to secondary laptop"""
     audio_bytes = indata.astype(np.float32).tobytes()
     max_udp = 65507
     if len(audio_bytes) <= max_udp:
@@ -31,7 +35,6 @@ def audio_callback(indata, frames, time_info, status):
             sock.sendto(audio_bytes[i:i + max_udp], target)
 
 def try_open_stream(device_idx, use_loopback=False):
-    """Try opening a stream, return it or None"""
     try:
         kwargs = dict(
             device=device_idx,
@@ -51,7 +54,6 @@ def try_open_stream(device_idx, use_loopback=False):
                     kwargs['extra_settings'] = ws
                 except:
                     pass
-
         stream = sd.InputStream(**kwargs)
         stream.start()
         stream.stop()
@@ -63,11 +65,10 @@ def main():
     print("=" * 52)
     print("  VALORANT SOUND RADAR — Windows Sender")
     print("=" * 52)
-    print(f"Streaming to {MAC_IP}:{PORT}")
-    print(f"Sample rate: {SAMPLE_RATE}Hz | Channels: {CHANNELS}\n")
+    print(f"Streaming to {MAC_IP}:{PORT}\n")
 
-    devices  = sd.query_devices()
-    hostapis = sd.query_hostapis()
+    devices    = sd.query_devices()
+    hostapis   = sd.query_hostapis()
 
     wasapi_idx = None
     for i, api in enumerate(hostapis):
@@ -78,7 +79,7 @@ def main():
     stream      = None
     stream_name = ""
 
-    # Strategy 1 — Stereo Mix by name search
+    # Strategy 1 — Stereo Mix by name
     print("Trying Strategy 1 — Stereo Mix...")
     for i, dev in enumerate(devices):
         if 'stereo mix' in dev['name'].lower() and dev['max_input_channels'] > 0:
@@ -88,7 +89,7 @@ def main():
                 stream_name = f"Stereo Mix: {dev['name']} (index {i})"
                 break
 
-    # Strategy 2 — WASAPI output devices with loopback flag
+    # Strategy 2 — WASAPI loopback
     if stream is None and wasapi_idx is not None:
         print("Trying Strategy 2 — WASAPI loopback...")
         for i, dev in enumerate(devices):
@@ -99,7 +100,7 @@ def main():
                     stream_name = f"WASAPI loopback: {dev['name']}"
                     break
 
-    # Strategy 3 — Default output with loopback
+    # Strategy 3 — Default output loopback
     if stream is None:
         print("Trying Strategy 3 — Default output loopback...")
         try:
@@ -111,7 +112,7 @@ def main():
         except:
             pass
 
-    # Strategy 4 — Any available stereo input
+    # Strategy 4 — Any stereo input fallback
     if stream is None:
         print("Trying Strategy 4 — Any stereo input...")
         for i, dev in enumerate(devices):
@@ -124,7 +125,7 @@ def main():
 
     if stream is None:
         print("\nCould not open any audio stream.")
-        print("\nFix — enable Stereo Mix manually:")
+        print("\nFix — enable Stereo Mix:")
         print("  1. Right click speaker icon in taskbar")
         print("  2. Sounds -> Recording tab")
         print("  3. Right click empty area -> Show Disabled Devices")
