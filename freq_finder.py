@@ -12,9 +12,7 @@ import socket
 import numpy as np
 import time
 
-PORT        = 5005
-SAMPLE_RATE = 44100
-CHANNELS    = 2
+from config import PORT, SAMPLE_RATE, CHANNELS
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind(("0.0.0.0", PORT))
