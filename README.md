@@ -174,8 +174,6 @@ FOOTSTEP_ENERGY_MAX  = 0.014  # upper limit before classified as gunshot bleed
 - Phase 2 — AI model trained on Valorant footstep recordings for better front/back accuracy
 - Wired headphone support via Y-splitter + USB audio adapter
 - Configurable UI (radar size, colors, sensitivity sliders)
-- Single machine mode — run both scripts on one Windows laptop
-- ESP32 physical radar device port
 
 ---
 
