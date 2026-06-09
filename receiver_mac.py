@@ -23,13 +23,21 @@ PORT        = 5005
 SAMPLE_RATE = 44100
 CHANNELS    = 2
 
-# Tuned to Valorant footstep harmonics: 86.1, 129.2, 172.3, 215.3Hz
+# Tuned to Valorant footstep harmonics: 86.1, 129.2, 172.3, 215.3, 258.4Hz
 FOOTSTEP_LOW         = 60      # Hz
-FOOTSTEP_HIGH        = 220     # Hz
-FOOTSTEP_ENERGY_MIN  = 0.001   # below this = silence, ignore
-FOOTSTEP_ENERGY_MAX  = 0.014   # above this = gunshot bleed, ignore
+FOOTSTEP_HIGH        = 260     # Hz
 GUNSHOT_FREQ_MIN     = 1500    # Hz
-GUNSHOT_RATIO_THRESH = 0.3     # high/low ratio above this = gunshot not footstep
+GUNSHOT_RATIO_THRESH = 0.4
+GUNSHOT_MEMORY       = 0.15
+
+# Dynamic thresholds — auto set during calibration
+FOOTSTEP_ENERGY_MIN  = 0.015
+FOOTSTEP_ENERGY_MAX  = 0.090
+
+# Calibration settings
+CALIB_MIN_MULT  = 1.5    # footstep must be 1.5x above noise floor
+CALIB_MAX_MULT  = 8.0    # footstep must be below 8x noise floor
+CALIB_SECONDS   = 3      # seconds to calibrate
 # ──────────────────────────────────────────────────────────
 
 # ─── DISPLAY ───────────────────────────────────────────────
@@ -58,8 +66,14 @@ audio_buffer    = deque(maxlen=10)
 pulses          = []
 sweep_angle     = 0.0
 lock            = threading.Lock()
-last_audio_time = 0
-signal_log      = deque(maxlen=8)
+last_audio_time      = 0
+signal_log           = deque(maxlen=8)
+last_high_freq_time  = 0.0    # tracks when last high freq spike happened
+recent_gunshot       = False  # True if high freq spike detected recently
+calibrated           = False
+calib_samples        = []
+calib_start_time     = None
+noise_floor          = 0.015
 # ──────────────────────────────────────────────────────────
 
 
@@ -124,10 +138,12 @@ def detect_direction(left_ch, right_ch, freqs, fft_mag):
     return angle % 360, confidence
 
 
-def is_footstep(footstep_e, gunshot_e, total_e):
+def is_footstep(footstep_e, gunshot_e, total_e, high_e):
     if footstep_e < FOOTSTEP_ENERGY_MIN:
         return False
     if footstep_e > FOOTSTEP_ENERGY_MAX:
+        return False
+    if high_e > 0.015:           # gunshots always have high_e > 0.03
         return False
     if total_e > 1e-6 and (gunshot_e / total_e) > GUNSHOT_RATIO_THRESH:
         return False
@@ -135,7 +151,7 @@ def is_footstep(footstep_e, gunshot_e, total_e):
 
 
 def analyze_chunk(raw_bytes):
-    global signal_log
+    global signal_log, last_high_freq_time, recent_gunshot
     try:
         audio = np.frombuffer(raw_bytes, dtype=np.float32)
         if len(audio) < CHANNELS:
@@ -156,13 +172,31 @@ def analyze_chunk(raw_bytes):
         mid_e      = get_band_energy(fft_mag, freqs, 300, 1500)
         total_e    = footstep_e + gunshot_e + mid_e
 
+        if not calibrated:
+            calibrate(footstep_e)
+            return None
+
         if total_e < FOOTSTEP_ENERGY_MIN:
             return None
 
         results = []
         now     = time.strftime('%H:%M:%S')
+        ts      = time.time()
 
-        if is_footstep(footstep_e, gunshot_e, total_e):
+        # Gunshot memory — gunshots always start with high freq spike
+        # If we see high freq (3000Hz+) mark the timestamp
+        # Then ignore any low freq activity for GUNSHOT_MEMORY seconds after
+        high_e = get_band_energy(fft_mag, freqs, 3000, 20000)
+        if high_e > 0.005 and mid_e < 0.003:
+            last_high_freq_time = ts
+            recent_gunshot      = True
+
+        # Reset gunshot memory after silence period
+        if ts - last_high_freq_time > GUNSHOT_MEMORY:
+            recent_gunshot = False
+
+        # ── Terminal logging — all events ───────────────
+        if is_footstep(footstep_e, gunshot_e, total_e, high_e):
             angle, conf = detect_direction(left_ch, right_ch, freqs, fft_mag)
             if angle is not None and conf > 0.05:
                 radius  = max(50, min(RADAR_RADIUS - 30,
@@ -170,9 +204,9 @@ def analyze_chunk(raw_bytes):
                 size    = max(5, min(16, int(footstep_e * 800)))
                 dir_str = "L" if 180 < angle <= 360 else "R" if 0 < angle <= 180 else "C"
                 results.append(Pulse(angle, radius, RED, size, "footstep", footstep_e))
-                signal_log.appendleft(
-                    f"{now}  FOOTSTEP  {footstep_e:.4f}  {dir_str}  {angle:.0f}deg"
-                )
+                log = f"{now}  FOOTSTEP  {footstep_e:.4f}  {dir_str}  {angle:.0f}deg"
+                signal_log.appendleft(log)
+                print(f"  >>> FOOTSTEP DETECTED  energy={footstep_e:.4f}  dir={dir_str}  angle={angle:.0f}deg")
 
         elif gunshot_e > 0.003 and gunshot_e > footstep_e * 2:
             angle, conf = detect_direction(left_ch, right_ch, freqs, fft_mag)
@@ -181,7 +215,9 @@ def analyze_chunk(raw_bytes):
                              int(RADAR_RADIUS * (1 - min(1, gunshot_e * 15)))))
                 size   = max(6, min(18, int(gunshot_e * 200)))
                 results.append(Pulse(angle, radius, YELLOW, size, "gunshot", gunshot_e))
-                signal_log.appendleft(f"{now}  GUNSHOT   {gunshot_e:.4f}")
+                log = f"{now}  GUNSHOT   {gunshot_e:.4f}"
+                signal_log.appendleft(log)
+                print(f"  >>> GUNSHOT DETECTED   energy={gunshot_e:.4f}")
 
         elif mid_e > 0.02:
             angle, conf = detect_direction(left_ch, right_ch, freqs, fft_mag)
@@ -189,11 +225,38 @@ def analyze_chunk(raw_bytes):
                 results.append(Pulse(angle, RADAR_RADIUS - 50,
                                      BLUE, max(4, min(10, int(mid_e * 100))),
                                      "ability", mid_e))
+                print(f"  >>> GUNSHOT DETECTED   energy={mid_e:.4f}")
+
 
         return results if results else None
 
     except Exception:
         return None
+
+
+def calibrate(footstep_e):
+    global calibrated, calib_samples, calib_start_time
+    global noise_floor, FOOTSTEP_ENERGY_MIN, FOOTSTEP_ENERGY_MAX
+
+    if calib_start_time is None:
+        calib_start_time = time.time()
+        print("Calibrating — stand still in Valorant for 3 seconds...")
+
+    calib_samples.append(footstep_e)
+    elapsed = time.time() - calib_start_time
+
+    if elapsed >= CALIB_SECONDS and len(calib_samples) > 10:
+        noise_floor         = float(np.mean(calib_samples))
+        FOOTSTEP_ENERGY_MIN = noise_floor * CALIB_MIN_MULT
+        FOOTSTEP_ENERGY_MAX = noise_floor * CALIB_MAX_MULT
+        calibrated          = True
+        print(f"Calibration complete!")
+        print(f"  Noise floor : {noise_floor:.5f}")
+        print(f"  Min thresh  : {FOOTSTEP_ENERGY_MIN:.5f}")
+        print(f"  Max thresh  : {FOOTSTEP_ENERGY_MAX:.5f}")
+        print("  Ready — walk around in Valorant")
+
+    return int(CALIB_SECONDS - elapsed)
 
 
 def udp_receiver():
@@ -266,7 +329,7 @@ def draw_labels(surface, fs, ft):
     pygame.draw.circle(surface, GREEN, CENTER, 8, 1)
 
 
-def draw_sidebar(surface, ft, ftiny, connected):
+def draw_sidebar(surface, ft, ftiny, connected, calibrated=False):
     sx = WIDTH - 180
     pygame.draw.line(surface, GREEN_DIM, (sx - 5, 0), (sx - 5, HEIGHT), 1)
 
@@ -279,9 +342,16 @@ def draw_sidebar(surface, ft, ftiny, connected):
     surface.blit(sub, (sx + 90 - sub.get_width() // 2, y))
     y += 25
 
-    col    = GREEN if connected else ORANGE
-    status = "LIVE" if connected else "WAITING"
-    s      = ft.render(status, True, col)
+    if not calibrated:
+        col    = ORANGE
+        status = "CALIBRATING..."
+    elif connected:
+        col    = GREEN
+        status = "LIVE"
+    else:
+        col    = ORANGE
+        status = "WAITING"
+    s = ft.render(status, True, col)
     surface.blit(s, (sx + 90 - s.get_width() // 2, y))
     y += 30
 
@@ -292,7 +362,7 @@ def draw_sidebar(surface, ft, ftiny, connected):
     for color, label in [
         (RED,    "Red    Footstep"),
         (YELLOW, "Yellow Gunshot"),
-        (BLUE,   "Blue   Ability"),
+        (BLUE,   "Blue   Gunshot"),
     ]:
         surface.blit(ftiny.render(label, True, color), (sx, y))
         y += 16
@@ -333,7 +403,7 @@ def main():
     recv_thread = threading.Thread(target=udp_receiver, daemon=True)
     recv_thread.start()
 
-    global sweep_angle, pulses, last_audio_time
+    global sweep_angle, pulses, last_audio_time, calibrated
 
     print("Valorant Sound Radar started.")
     print(f"Footstep range: {FOOTSTEP_LOW}-{FOOTSTEP_HIGH}Hz")
@@ -373,7 +443,7 @@ def main():
 
         draw_labels(screen, fs, ftiny)
         connected = (time.time() - last_audio_time) < 2.0
-        draw_sidebar(screen, ft, ftiny, connected)
+        draw_sidebar(screen, ft, ftiny, connected, calibrated)
 
         pygame.display.flip()
         clock.tick(FPS)
