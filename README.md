@@ -1,4 +1,4 @@
-# Valorant Sound Radar
+# Valorant Visual Audio
 
 A real-time external sound visualizer for Valorant — because the game has no visual audio indicator.
 
