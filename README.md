@@ -6,6 +6,10 @@ Streams game audio from your Windows gaming laptop to a secondary device over Wi
 
 ---
 
+<img width="695" height="719" alt="Screenshot 2026-06-06 at 2 53 04 PM" src="https://github.com/user-attachments/assets/ec157371-1b2e-4376-9ba5-5933fd9b072e" />
+
+---
+
 ## What It Does
 
 ```
