@@ -2,13 +2,7 @@
 
 A real-time external sound visualizer for Valorant — because the game has no visual audio indicator.
 
-<table>
-  <tr>
-    <td><img width="448" alt="Radar HUD view" src="https://github.com/user-attachments/assets/857ca94c-0a79-4cde-8a9c-955f21b460bc" /></td>
-    <td><img width="441" alt="Orbital HUD view" src="https://github.com/user-attachments/assets/4a9c1cc0-db40-4d40-9acb-dc19ca2b1564" /></td>
-  </tr>
-</table>
-
+https://github.com/user-attachments/assets/7c5d8f68-e5cc-4033-b10f-7df8798f3d7a
 
 Streams game audio from a Windows gaming laptop to a secondary device over WiFi, classifies sounds using a custom-trained CNN, and displays the result as a real-time directional HUD showing where sounds are coming from.
 
