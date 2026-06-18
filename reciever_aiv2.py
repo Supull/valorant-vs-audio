@@ -1,13 +1,18 @@
 """
-VALORANT SOUND RADAR — Mac Receiver v4 (AI Powered)
-====================================================
-Uses a trained CNN (model.pth) to classify audio as
-footstep, gunshot, or silence in real time.
+VALORANT SOUND RADAR — Mac Receiver v4.3 (Minimal Orbital HUD)
+================================================================
+Uses a trained CNN (modelv2.pth) to classify audio in real time.
+
+Clean, minimal HUD: a center crosshair dot surrounded by a faint
+orbit ring. When a sound is detected, a curved arc illuminates on
+that ring in the direction of the source — flaring outward with
+layered glow trails before narrowing and fading. No sidebar, no
+clutter — the arc animation itself conveys direction and intensity.
 
 Requirements:
   pip3 install numpy pygame torch torchaudio soundfile
 
-Run: python3 receiver_ai.py
+Run: python3 receiver_ai_v2.py
 """
 
 import socket
@@ -29,18 +34,22 @@ CLIP_DURATION = 0.5
 BUFFER_SAMPLES = int(SAMPLE_RATE * CLIP_DURATION)
 RING_SIZE     = SAMPLE_RATE * 3
 
-MODEL_PATH    = "model.pth"
+MODEL_PATH    = "modelv2.pth"
 
 INFERENCE_INTERVAL   = 0.1   # run model 10x per second
 CONFIDENCE_THRESHOLD = 0.6
 # ──────────────────────────────────────────────────────────
 
 # ─── DISPLAY ───────────────────────────────────────────────
-WIDTH        = 700
-HEIGHT       = 700
+WIDTH        = 450
+HEIGHT       = 450
 CENTER       = (WIDTH // 2, HEIGHT // 2)
-RADAR_RADIUS = 270
+RADAR_RADIUS = 270           # kept for compatibility with detect_direction scaling
 FPS          = 60
+
+# Pulse ring specific settings — reactive HUD style (no travel motion)
+PULSE_DURATION    = 0.6      # seconds each pulse stays visible
+CROSSHAIR_SIZE    = 14
 # ──────────────────────────────────────────────────────────
 
 # ─── COLORS ────────────────────────────────────────────────
@@ -51,6 +60,7 @@ GRID_COLOR  = (0,   38,  12)
 RED         = (255, 60,  60)
 YELLOW      = (255, 220, 50)
 BLUE        = (50,  150, 255)
+CYAN        = (80,  230, 230)
 WHITE       = (255, 255, 255)
 ORANGE      = (255, 140, 0)
 DIM         = (80,  80,  80)
@@ -160,46 +170,119 @@ buffer_lock   = threading.Lock()
 
 # ─── STATE ─────────────────────────────────────────────────
 pulses               = []
-sweep_angle          = 0.0
 last_audio_time      = 0
 signal_log           = deque(maxlen=8)
 last_inference_time  = 0
-last_probs           = np.array([0.33, 0.33, 0.33])
+last_probs           = np.ones(len(CLASSES)) / len(CLASSES)
 last_prediction      = "silence"
 # ──────────────────────────────────────────────────────────
 
 
-class Pulse:
-    def __init__(self, angle, radius, color, size, label, energy):
-        self.angle    = angle
-        self.radius   = radius
-        self.color    = color
-        self.size     = size
-        self.label    = label
-        self.energy   = energy
-        self.alpha    = 255
-        self.birth    = time.time()
-        self.lifetime = 3.5
+class PulseArc:
+    """
+    Dynamic radial HUD pulse — a curved arc segment that lights up
+    on a fixed orbit ring around the crosshair, at the angle the
+    sound came from. The arc expands in angular width on spawn,
+    glows brightly, then contracts and fades while leaving a
+    trailing afterglow — like a comet sweep along the ring rather
+    than a static blob.
+    """
+    ORBIT_RADIUS = 150   # fixed distance of the orbit ring from center
+
+    def __init__(self, angle, color, label, energy, intensity):
+        self.angle     = angle                          # center angle of the arc
+        self.color     = color
+        self.label     = label
+        self.energy    = energy
+        self.intensity = max(0.15, min(1.0, intensity))
+
+        self.birth      = time.time()
+        self.duration   = PULSE_DURATION
+        self.max_span   = 26 + 34 * self.intensity       # max angular width in degrees
+        self.max_thick  = 4 + 7 * self.intensity          # arc stroke thickness
+        self.alpha      = 255
 
     def update(self):
-        age        = time.time() - self.birth
-        self.alpha = max(0, int(255 * (1 - age / self.lifetime)))
-        return self.alpha > 0
+        age = time.time() - self.birth
+        t   = age / self.duration
+        if t >= 1.0:
+            return False
+        # Fade starts after the initial flare (first 35%)
+        if t > 0.35:
+            fade_t     = (t - 0.35) / 0.65
+            self.alpha = max(0, int(255 * (1 - fade_t) ** 1.3))
+        else:
+            self.alpha = 255
+        return True
+
+    def _to_pygame_rad(self, deg):
+        # our convention: 0=front(up), 90=right, clockwise
+        # pygame arc: 0=right(east), increases counter-clockwise
+        return math.radians(90 - deg)
 
     def draw(self, surface):
         if self.alpha <= 0:
             return
+
+        age = time.time() - self.birth
+        t   = age / self.duration
+
+        # Angular span: flares wide quickly then narrows back down
+        if t < 0.35:
+            grow_t = t / 0.35
+            span   = self.max_span * (1 - (1 - grow_t) ** 3)   # fast ease-out grow
+        else:
+            shrink_t = (t - 0.35) / 0.65
+            span     = self.max_span * (1 - shrink_t * 0.4)     # gently narrows
+
         r, g, b = self.color
-        sz = self.size
-        s  = pygame.Surface((sz * 2 + 10, sz * 2 + 10), pygame.SRCALPHA)
-        pygame.draw.circle(s, (r, g, b, self.alpha // 4), (sz + 5, sz + 5), sz + 4)
-        pygame.draw.circle(s, (r, g, b, self.alpha),      (sz + 5, sz + 5), sz)
-        pygame.draw.circle(s, (255, 255, 255, self.alpha // 2),
-                           (sz + 5, sz + 5), max(1, sz // 3))
+
+        size   = int((self.ORBIT_RADIUS + 40) * 2)
+        s      = pygame.Surface((size, size), pygame.SRCALPHA)
+        local_center = (size // 2, size // 2)
+        rect = pygame.Rect(local_center[0] - self.ORBIT_RADIUS,
+                            local_center[1] - self.ORBIT_RADIUS,
+                            self.ORBIT_RADIUS * 2, self.ORBIT_RADIUS * 2)
+
+        start_deg = self.angle - span / 2
+        end_deg   = self.angle + span / 2
+
+        # Outer soft glow trail (wider arc, thicker, dim)
+        try:
+            pygame.draw.arc(s, (r, g, b, max(0, self.alpha // 4)), rect,
+                            self._to_pygame_rad(end_deg + 6),
+                            self._to_pygame_rad(start_deg - 6),
+                            int(self.max_thick * 2.4))
+        except Exception:
+            pass
+
+        # Mid glow layer
+        try:
+            pygame.draw.arc(s, (r, g, b, max(0, self.alpha // 2)), rect,
+                            self._to_pygame_rad(end_deg + 2),
+                            self._to_pygame_rad(start_deg - 2),
+                            int(self.max_thick * 1.4))
+        except Exception:
+            pass
+
+        # Bright core arc
+        try:
+            pygame.draw.arc(s, (r, g, b, self.alpha), rect,
+                            self._to_pygame_rad(end_deg),
+                            self._to_pygame_rad(start_deg),
+                            max(1, int(self.max_thick)))
+        except Exception:
+            pass
+
+        # Hot white highlight at the exact center angle (peak intensity point)
         rad = math.radians(self.angle)
-        x   = int(CENTER[0] + self.radius * math.sin(rad))
-        y   = int(CENTER[1] - self.radius * math.cos(rad))
-        surface.blit(s, (x - sz - 5, y - sz - 5))
+        hx  = local_center[0] + self.ORBIT_RADIUS * math.sin(rad)
+        hy  = local_center[1] - self.ORBIT_RADIUS * math.cos(rad)
+        glow_r = 3 + 4 * self.intensity
+        pygame.draw.circle(s, (255, 255, 255, self.alpha // 2),
+                           (int(hx), int(hy)), int(glow_r))
+
+        surface.blit(s, (CENTER[0] - size // 2, CENTER[1] - size // 2))
 
 
 def get_band_energy(fft_mag, freqs, low, high):
@@ -313,159 +396,96 @@ def run_inference():
     if angle is None or conf < 0.05:
         return []
 
+    # Suppress detections directly on the front/back vertical axis —
+    # these are almost always your own footsteps/movement, not enemies
+    CENTER_DEAD_ZONE = 12  # degrees on either side of 0 and 180
+    dist_from_front = min(angle, 360 - angle)
+    dist_from_back   = abs(angle - 180)
+    if dist_from_front < CENTER_DEAD_ZONE or dist_from_back < CENTER_DEAD_ZONE:
+        return []
+
     now = time.strftime('%H:%M:%S')
 
     if pred_class == "footstep":
-        radius  = max(50, min(RADAR_RADIUS - 30,
-                      int(RADAR_RADIUS * (1 - min(1, energy * 80)))))
-        size    = max(5, min(16, int(energy * 800)))
+        intensity = min(1.0, energy * 80)
         dir_str = "L" if 180 < angle <= 360 else "R" if 0 < angle <= 180 else "C"
         log = f"{now}  FOOTSTEP  conf={confidence:.2f}  {dir_str}  {angle:.0f}deg"
         signal_log.appendleft(log)
         print(f"  >>> FOOTSTEP  conf={confidence:.2f}  energy={energy:.4f}  dir={dir_str}  angle={angle:.0f}deg")
-        return [Pulse(angle, radius, RED, size, "footstep", energy)]
+        return [PulseArc(angle, RED, "footstep", energy, intensity)]
 
-    elif pred_class == "gunshot":
-        radius = max(50, min(RADAR_RADIUS - 30,
-                     int(RADAR_RADIUS * (1 - min(1, energy * 15)))))
-        size   = max(6, min(18, int(energy * 200)))
-        log = f"{now}  GUNSHOT   conf={confidence:.2f}"
+    elif pred_class in ("gunshot", "spectre"):
+        intensity = min(1.0, energy * 15)
+        label = "GUNSHOT" if pred_class == "gunshot" else "SPECTRE"
+        log = f"{now}  {label:8} conf={confidence:.2f}"
         signal_log.appendleft(log)
-        print(f"  >>> GUNSHOT   conf={confidence:.2f}  energy={energy:.4f}")
-        return [Pulse(angle, radius, YELLOW, size, "gunshot", energy)]
+        print(f"  >>> {label}   conf={confidence:.2f}  energy={energy:.4f}")
+        return [PulseArc(angle, YELLOW, pred_class, energy, intensity)]
+
+    elif pred_class == "jump":
+        intensity = min(1.0, energy * 100)
+        dir_str = "L" if 180 < angle <= 360 else "R" if 0 < angle <= 180 else "C"
+        log = f"{now}  JUMP      conf={confidence:.2f}  {dir_str}  {angle:.0f}deg"
+        signal_log.appendleft(log)
+        print(f"  >>> JUMP      conf={confidence:.2f}  energy={energy:.4f}  dir={dir_str}  angle={angle:.0f}deg")
+        return [PulseArc(angle, CYAN, "jump", energy, intensity)]
 
     return []
 
 
-def draw_radar_bg(surface):
+def draw_background(surface):
+    """Clean dark HUD background — minimal, just the orbit track"""
     surface.fill(DARK_GREEN)
-    for r in range(RADAR_RADIUS // 4, RADAR_RADIUS + 1, RADAR_RADIUS // 4):
-        pygame.draw.circle(surface, GRID_COLOR, CENTER, r, 1)
-    pygame.draw.line(surface, GRID_COLOR,
-                     (CENTER[0], CENTER[1] - RADAR_RADIUS),
-                     (CENTER[0], CENTER[1] + RADAR_RADIUS), 1)
-    pygame.draw.line(surface, GRID_COLOR,
-                     (CENTER[0] - RADAR_RADIUS, CENTER[1]),
-                     (CENTER[0] + RADAR_RADIUS, CENTER[1]), 1)
-    off = int(RADAR_RADIUS * 0.707)
-    pygame.draw.line(surface, GRID_COLOR,
-                     (CENTER[0] - off, CENTER[1] - off),
-                     (CENTER[0] + off, CENTER[1] + off), 1)
-    pygame.draw.line(surface, GRID_COLOR,
-                     (CENTER[0] + off, CENTER[1] - off),
-                     (CENTER[0] - off, CENTER[1] + off), 1)
-    pygame.draw.circle(surface, GREEN_DIM, CENTER, RADAR_RADIUS, 2)
+    # Single subtle orbit ring — where all arcs appear
+    pygame.draw.circle(surface, GREEN_DIM, CENTER, PulseArc.ORBIT_RADIUS, 1)
 
 
-def draw_sweep(surface, angle_deg):
-    surf  = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
-    trail = 65
-    steps = 35
-    for i in range(steps):
-        a   = angle_deg - (trail * i / steps)
-        alp = int(90 * (1 - i / steps))
-        rad = math.radians(a)
-        ex  = int(CENTER[0] + RADAR_RADIUS * math.sin(rad))
-        ey  = int(CENTER[1] - RADAR_RADIUS * math.cos(rad))
-        pygame.draw.line(surf, (0, 255, 70, alp), CENTER, (ex, ey), 2)
-    rad = math.radians(angle_deg)
-    ex  = int(CENTER[0] + RADAR_RADIUS * math.sin(rad))
-    ey  = int(CENTER[1] - RADAR_RADIUS * math.cos(rad))
-    pygame.draw.line(surf, (0, 255, 70, 220), CENTER, (ex, ey), 2)
-    surface.blit(surf, (0, 0))
+def draw_crosshair(surface):
+    """Center dot representing the player, with small crosshair ticks"""
+    cx, cy = CENTER
+    s = CROSSHAIR_SIZE
+
+    # Outer glow
+    glow = pygame.Surface((s * 6, s * 6), pygame.SRCALPHA)
+    pygame.draw.circle(glow, (*GREEN, 40), (s * 3, s * 3), s * 2)
+    surface.blit(glow, (cx - s * 3, cy - s * 3))
+
+    # Crosshair ticks
+    gap = 6
+    pygame.draw.line(surface, GREEN, (cx - s, cy), (cx - gap, cy), 2)
+    pygame.draw.line(surface, GREEN, (cx + gap, cy), (cx + s, cy), 2)
+    pygame.draw.line(surface, GREEN, (cx, cy - s), (cx, cy - gap), 2)
+    pygame.draw.line(surface, GREEN, (cx, cy + gap), (cx, cy + s), 2)
+
+    # Center dot
+    pygame.draw.circle(surface, WHITE, (cx, cy), 4)
+    pygame.draw.circle(surface, GREEN, (cx, cy), 7, 1)
 
 
-def draw_labels(surface, fs, ft):
-    p = 20
-    for text, pos in [
-        ("N", (CENTER[0] - 6, CENTER[1] - RADAR_RADIUS - p)),
-        ("S", (CENTER[0] - 6, CENTER[1] + RADAR_RADIUS + 5)),
-        ("E", (CENTER[0] + RADAR_RADIUS + 7, CENTER[1] - 8)),
-        ("W", (CENTER[0] - RADAR_RADIUS - p, CENTER[1] - 8)),
-    ]:
-        surface.blit(fs.render(text, True, GREEN_DIM), pos)
-    you = ft.render("YOU", True, WHITE)
-    surface.blit(you, (CENTER[0] - you.get_width() // 2, CENTER[1] + 10))
-    pygame.draw.circle(surface, WHITE, CENTER, 5)
-    pygame.draw.circle(surface, GREEN, CENTER, 8, 1)
-
-
-def draw_sidebar(surface, ft, ftiny, connected):
-    sx = WIDTH - 180
-    pygame.draw.line(surface, GREEN_DIM, (sx - 5, 0), (sx - 5, HEIGHT), 1)
-
-    y     = 15
-    title = ft.render("SOUND RADAR — AI", True, GREEN)
-    surface.blit(title, (sx + 90 - title.get_width() // 2, y))
-    y += 20
-
-    sub = ftiny.render("CNN Model Active", True, GREEN_DIM)
-    surface.blit(sub, (sx + 90 - sub.get_width() // 2, y))
-    y += 25
-
+def draw_status(surface, ftiny, connected):
+    """Minimal connection indicator — top left corner only"""
     col    = GREEN if connected else ORANGE
     status = "LIVE" if connected else "WAITING"
-    s      = ft.render(status, True, col)
-    surface.blit(s, (sx + 90 - s.get_width() // 2, y))
-    y += 30
-
-    pygame.draw.line(surface, GREEN_DIM, (sx, y), (sx + 175, y), 1)
-    y += 10
-    surface.blit(ft.render("LEGEND", True, DIM), (sx, y))
-    y += 18
-    for color, label in [
-        (RED,    "Red    Footstep"),
-        (YELLOW, "Yellow Gunshot"),
-    ]:
-        surface.blit(ftiny.render(label, True, color), (sx, y))
-        y += 16
-
-    y += 5
-    pygame.draw.line(surface, GREEN_DIM, (sx, y), (sx + 175, y), 1)
-    y += 10
-
-    surface.blit(ft.render("MODEL OUTPUT", True, DIM), (sx, y))
-    y += 18
-    for i, cls in enumerate(CLASSES):
-        prob  = last_probs[i]
-        color = RED if cls == "footstep" else YELLOW if cls == "gunshot" else DIM
-        bar_w = int(150 * prob)
-        pygame.draw.rect(surface, (30, 30, 30), (sx, y, 150, 10))
-        pygame.draw.rect(surface, color, (sx, y, bar_w, 10))
-        label = ftiny.render(f"{cls} {prob:.2f}", True, WHITE)
-        surface.blit(label, (sx, y + 11))
-        y += 24
-
-    y += 5
-    pygame.draw.line(surface, GREEN_DIM, (sx, y), (sx + 175, y), 1)
-    y += 10
-    surface.blit(ft.render("SIGNAL LOG", True, DIM), (sx, y))
-    y += 18
-    for entry in signal_log:
-        parts = entry.split("  ")
-        color = RED if "FOOTSTEP" in entry else YELLOW
-        surface.blit(ftiny.render(parts[0], True, DIM), (sx, y))
-        y += 12
-        surface.blit(ftiny.render("  ".join(parts[1:]), True, color), (sx, y))
-        y += 14
+    dot_r  = 4
+    pygame.draw.circle(surface, col, (16, 16), dot_r)
+    label = ftiny.render(status, True, col)
+    surface.blit(label, (26, 10))
 
 
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Valorant Sound Radar — AI")
+    pygame.display.set_caption("Sound HUD")
     clock  = pygame.time.Clock()
 
-    fs    = pygame.font.SysFont("monospace", 14, bold=True)
-    ft    = pygame.font.SysFont("monospace", 11, bold=True)
     ftiny = pygame.font.SysFont("monospace", 10)
 
     recv_thread = threading.Thread(target=udp_receiver, daemon=True)
     recv_thread.start()
 
-    global sweep_angle, pulses, last_inference_time
+    global pulses, last_inference_time
 
-    print("Valorant Sound Radar (AI) started.")
+    print("Valorant Sound Radar — Orbital Pulse HUD (AI) started.")
     print("Press Q to quit\n")
 
     running = True
@@ -483,20 +503,18 @@ def main():
             if new_pulses:
                 pulses.extend(new_pulses)
 
-        sweep_angle = (sweep_angle + 1.5) % 360
-        pulses      = [p for p in pulses if p.update()]
+        pulses = [p for p in pulses if p.update()]
 
-        draw_radar_bg(screen)
-        draw_sweep(screen, sweep_angle)
+        draw_background(screen)
 
         ps = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
         for p in pulses:
             p.draw(ps)
         screen.blit(ps, (0, 0))
 
-        draw_labels(screen, fs, ftiny)
+        draw_crosshair(screen)
         connected = (time.time() - last_audio_time) < 2.0
-        draw_sidebar(screen, ft, ftiny, connected)
+        draw_status(screen, ftiny, connected)
 
         pygame.display.flip()
         clock.tick(FPS)

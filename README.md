@@ -1,12 +1,8 @@
-# Valorant Visual Audio
+# Valorant Sound Radar
 
 A real-time external sound visualizer for Valorant — because the game has no visual audio indicator.
 
-Streams game audio from your Windows gaming laptop to a secondary device over WiFi, runs FFT analysis to isolate footstep frequencies, and displays a live directional radar showing where sounds are coming from.
-
----
-
-<img width="695" height="719" alt="Screenshot 2026-06-06 at 2 53 04 PM" src="https://github.com/user-attachments/assets/ec157371-1b2e-4376-9ba5-5933fd9b072e" />
+Streams game audio from a Windows gaming laptop to a secondary device over WiFi, classifies sounds using a custom-trained CNN, and displays the result as a real-time directional HUD showing where sounds are coming from.
 
 ---
 
@@ -17,20 +13,41 @@ Gaming Laptop (Windows)          Secondary Laptop (Mac)
 ────────────────────────         ──────────────────────
 Valorant plays audio      WiFi   Receives audio stream
        |                 ──────►        |
-WASAPI captures it                 FFT analysis
-       |                         splits into bands
-Streams over UDP                       |
-                                  Radar display
-                                 shows direction
-                                  of footsteps
+WASAPI captures it                 CNN classification
+       |                          (footstep/gunshot/
+Streams over UDP                   spectre/jump/silence)
+                                        |
+                                  Direction detection
+                                  (stereo + HRTF analysis)
+                                        |
+                                  Real-time HUD display
 ```
 
-- Red pulses    — Footsteps (60-220Hz, tuned to Valorant's exact footstep harmonics)
-- Yellow pulses — Gunshots / abilities (1500Hz+)
-- Blue pulses   — Mid frequency sounds
-- Pulse size    — louder = bigger = closer
-- Pulse position — left/right direction via stereo channel analysis
-- Front/back    — inferred from HRTF frequency shaping (requires HRTF ON in Valorant)
+Two interchangeable visualization modes are included:
+
+- `receiver_mac.py` — top-down radar view with a rotating sweep line, signal log, and frequency-threshold detection (the original Phase 1 approach, kept for reference)
+- `receiver_ai.py` — same radar view, but detection is powered by the trained CNN instead of frequency thresholds
+- `receiver_ai_v2.py` — minimal orbital HUD: a center crosshair surrounded by a faint ring, with curved glowing arcs flaring up in the direction of detected sounds
+
+---
+
+## Why a CNN Instead of Pure Frequency Analysis
+
+Early versions used FFT-based frequency thresholds to separate footsteps from gunshots. This worked until real gameplay data revealed that several sound types occupy nearly identical frequency ranges and energy levels, most notably footsteps versus the Spectre's suppressed gunshot, and jump landings versus regular footsteps. No amount of threshold tuning could reliably separate these, because the distinguishing feature is the *shape* of the sound over time, not a single frequency snapshot.
+
+The project pivoted to training a small CNN on mel spectrograms of self-recorded gameplay audio, letting the model learn that temporal shape directly. This raised real-world reliability substantially, especially on the previously confused edge cases.
+
+---
+
+## Model Details
+
+| | |
+|---|---|
+| Classes | footstep, gunshot, spectre, jump, silence |
+| Training clips | 1,120 self-collected, labeled from live gameplay |
+| Validation accuracy | 97.3% |
+| Architecture | Small CNN over mel spectrograms (3 conv blocks + FC head) |
+| Inference | ~44ms per clip on Apple Silicon (MPS) |
 
 ---
 
@@ -43,7 +60,7 @@ Streams over UDP                       |
 
 ### Secondary Laptop (Mac or any OS)
 - Python 3.x
-- `pip3 install numpy pygame scipy`
+- `pip3 install numpy pygame torch torchaudio soundfile scipy`
 
 ---
 
@@ -61,10 +78,9 @@ Right click Stereo Mix -> Enable -> Set as Default Device
 Settings -> Audio -> HRTF -> ON
 Windows -> Spatial Sound -> OFF
 ```
+Turning off Spatial Sound prevents double-processing of the HRTF signal, which would otherwise corrupt direction detection.
 
-Turning off Spatial Sound is important — it prevents double processing of the HRTF signal which would corrupt direction detection.
-
-### 3. Find Your Secondary Laptop IP
+### 3. Find Your Secondary Laptop's IP
 On Mac:
 ```bash
 ipconfig getifaddr en0
@@ -73,7 +89,7 @@ On Windows:
 ```cmd
 ipconfig
 ```
-Look for IPv4 Address under the WiFi adapter.
+Look for the IPv4 address under the WiFi adapter.
 
 ### 4. Set the IP in the sender script
 Open `sender_windows.py` and update:
@@ -85,81 +101,86 @@ MAC_IP = "your.secondary.laptop.ip"
 
 ## Running
 
-### Step 1 — Start receiver on secondary laptop first
+### Step 1 — Start the receiver on the secondary laptop first
 ```bash
-python3 receiver_mac.py
+python3 receiver_ai_v2.py
 ```
-Radar window opens and waits for the audio stream.
 
-### Step 2 — Start sender on gaming laptop
+### Step 2 — Start the sender on the gaming laptop
 ```cmd
 python sender_windows.py
 ```
 Expected output:
 ```
 Streaming via: Stereo Mix
-Radar should show pulses on Mac now!
 ```
 
 ### Step 3 — Launch Valorant and play
 
 ---
 
-## Frequency Finder (Calibration Tool)
+## Collecting Training Data
 
-Use this to verify footstep frequencies for your specific setup:
+`recorder.py` lets you build your own labeled dataset directly from gameplay:
 
 ```bash
-python3 freq_finder.py
+python3 recorder.py
 ```
 
-Walk around in Valorant and watch which frequencies appear in the terminal. Then update `FOOTSTEP_LOW` and `FOOTSTEP_HIGH` in `receiver_mac.py` accordingly.
+Controls:
+```
+3 = footstep      4 = gunshot       5 = silence
+6 = jump          7 = spectre       Q = quit
+```
 
-Measured Valorant footstep profile:
+Press the corresponding key the moment you hear each sound. Clips are saved as 0.5-second `.wav` files into `data/<class>/`, and numbering automatically continues across sessions without overwriting existing clips.
+
+Run `diagnose.py` afterward to verify no clips were saved as silent/corrupted before training:
+```bash
+python3 diagnose.py
 ```
-Base frequency:  86.1Hz
-Harmonics:       129.2Hz, 172.3Hz, 215.3Hz
-Detection range: 60-220Hz
-Energy range:    0.001-0.014
+
+---
+
+## Training
+
+```bash
+python3 train.py
 ```
+
+Loads everything in `data/`, converts each clip to a normalized mel spectrogram, trains the CNN with class-weighted loss to handle imbalance, and saves the best-performing checkpoint to `modelv2.pth`.
 
 ---
 
 ## How Direction Detection Works
 
-Left / Right — accurate
+**Left / Right — accurate**
 ```
 Measured from stereo channel energy difference.
-Left channel louder  -> enemy on left
-Right channel louder -> enemy on right
+Left channel louder  -> sound from the left
+Right channel louder -> sound from the right
 ```
 
-Front / Back — estimated
+**Front / Back — estimated**
 ```
 HRTF encodes direction via subtle frequency shaping.
 Front sounds boost 4-8kHz slightly.
 Back sounds cut 8-16kHz.
-Requires Valorant HRTF ON to function.
+Requires Valorant HRTF ON to function correctly.
+```
+
+**Center dead-zone filtering**
+```
+Detections landing within ~12 degrees of the front/back axis
+are suppressed, since these are almost always the player's own
+footsteps rather than nearby enemies.
 ```
 
 ---
 
 ## Why Not an Overlay
 
-Vanguard (Valorant's anti-cheat) flags transparent windows drawn over the game. This project runs entirely on a separate physical device — Vanguard cannot detect it at all. It is the audio equivalent of putting a microphone next to your speaker and does not touch the game process in any way.
-
----
-
-## Tuning
-
-In `receiver_mac.py`:
-
-```python
-FOOTSTEP_LOW         = 60     # Hz lower bound
-FOOTSTEP_HIGH        = 220    # Hz upper bound
-FOOTSTEP_ENERGY_MIN  = 0.001  # sensitivity — lower = more sensitive
-FOOTSTEP_ENERGY_MAX  = 0.014  # upper limit before classified as gunshot bleed
-```
+Vanguard (Valorant's anti-cheat) flags transparent, always-on-top windows drawn directly over the game, since this is the same window signature used by ESP/aimbot overlays. This project instead runs on a separate physical device, which is completely outside Vanguard's reach, and is functionally equivalent to recording a speaker with a microphone. It never touches the Valorant process, reads game memory, or injects code.
 
 ---
 
@@ -167,20 +188,26 @@ FOOTSTEP_ENERGY_MAX  = 0.014  # upper limit before classified as gunshot bleed
 
 | File | Device | Purpose |
 |---|---|---|
-| `sender_windows.py` | Gaming laptop (Windows) | Captures WASAPI audio, streams over UDP |
-| `receiver_mac.py` | Secondary laptop | Receives stream, runs FFT, shows radar |
+| `sender_windows.py` | Gaming laptop (Windows) | Captures WASAPI/Stereo Mix audio, streams over UDP |
+| `receiver_mac.py` | Secondary laptop | Radar view, frequency-threshold detection (Phase 1) |
+| `receiver_ai.py` | Secondary laptop | Radar view, CNN-based detection (Phase 2) |
+| `receiver_ai_v2.py` | Secondary laptop | Minimal orbital HUD, CNN-based detection (Phase 2) |
+| `recorder.py` | Secondary laptop | Collects labeled training clips from live gameplay |
+| `diagnose.py` | Secondary laptop | Verifies collected clips contain real audio |
+| `train.py` | Secondary laptop | Trains the CNN and saves `modelv2.pth` |
 | `freq_finder.py` | Secondary laptop | Calibration tool — prints dominant frequencies live |
 
 ---
 
 ## Roadmap
 
-- Phase 2 — AI model trained on Valorant footstep recordings for better front/back accuracy
-- Wired headphone support via Y-splitter + USB audio adapter
-- Configurable UI (radar size, colors, sensitivity sliders)
+- Active learning loop — auto-flag low-confidence predictions during play for quick review and retraining
+- More training data across different maps and agents for robustness
+- Single-laptop borderless-window mode
+- ESP32 physical HUD device port
 
 ---
 
 ## Disclaimer
 
-This tool only reads audio that is already playing on your system. It does not interact with the Valorant game process, read game memory, or inject code of any kind. It is fully external and does not violate Valorant's Terms of Service.
+This tool only reads audio that is already playing on the system. It does not interact with the Valorant game process, read game memory, or inject code of any kind. It is fully external and does not violate Valorant's Terms of Service.
