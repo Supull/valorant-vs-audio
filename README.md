@@ -216,6 +216,19 @@ Vanguard (Valorant's anti-cheat) flags transparent, always-on-top windows drawn 
 
 ---
 
+## Contributing
+
+This started as a personal project but contributions are welcome — 
+whether that's more training data, support for other games, bug 
+fixes, or new visualization styles. Open an issue or submit a pull 
+request.
+
+If you collect your own training data and retrain the model, 
+consider sharing your `data/` clips or trained checkpoint so others 
+can build on it.
+
+---
+
 ## Disclaimer
 
 This tool only reads audio that is already playing on the system. It does not interact with the Valorant game process, read game memory, or inject code of any kind. It is fully external and does not violate Valorant's Terms of Service.
